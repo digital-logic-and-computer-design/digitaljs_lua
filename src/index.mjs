@@ -45,6 +45,7 @@ const {
     lua_resume,
     lua_remove,
     lua_setfield,
+    lua_sethook,
     lua_setmetatable,
     lua_setglobal,
     lua_isboolean,
@@ -61,6 +62,7 @@ const {
     lua_yield,
     lua_status,
     LUA_OK,
+    LUA_MASKCOUNT,
     LUA_YIELD,
     LUA_REGISTRYINDEX
 } = lua;
@@ -306,6 +308,7 @@ export class LuaRunner {
             if (!lua_isyieldable(L)) luaL_error(L, "sim.sleep: thread not yieldable");
             const tdata = this.#threads.get(L);
             if (tdata === undefined) luaL_error(L, "sim.sleep: thread not suspendable");
+            tdata.hasYield = true;
             const delay = luaL_checkinteger(L, 1);
             luaL_argcheck(L, delay > 0, 1, "sim.sleep: too short delay");
             this._enqueue(tdata, this.#circuit.tick + delay);
@@ -315,6 +318,7 @@ export class LuaRunner {
             if (!lua_isyieldable(L)) luaL_error(L, "sim.wait: thread not yieldable");
             const tdata = this.#threads.get(L);
             if (tdata === undefined) luaL_error(L, "sim.wait: thread not suspendable");
+            tdata.hasYield = true;
             const delay = luaL_optinteger(L, 2, undefined);
             const evt = lua_checkevent(L, 1);
             console.assert(tdata.waitMonitors === undefined);
@@ -480,12 +484,25 @@ export class LuaRunner {
         const pid = luaL_ref(this.#L, LUA_REGISTRYINDEX);
         const new_tdata = {
             pid: pid,
-            env: thr, 
+            env: thr,
             waitMonitors: undefined,
-            alarmId: undefined
+            alarmId: undefined,
+            timeoutId: undefined,
+            hasYield: false
         };
         this.#pidthreads.set(pid, new_tdata);
         this.#threads.set(thr, new_tdata);
+        lua_sethook(thr, (thr) => {
+            if (new_tdata.hasYield) {
+                new_tdata.hasYield = false;
+                return;
+            }
+            new_tdata.timeoutId = setTimeout(() => {
+                new_tdata.timeoutId = undefined;
+                this._resume(new_tdata);
+            }, 0);
+            lua_yield(thr, 0);
+        }, LUA_MASKCOUNT, 1e7);
         try {
             const ret_ls = lua_load_jsstring_error(thr, source);
             const ret_re = lua_resume_error(thr, null, 0);
@@ -514,6 +531,10 @@ export class LuaRunner {
         if (tdata.alarmId !== undefined) {
             this.#circuit.unalarm(tdata.alarmId);
             tdata.alarmId = undefined;
+        }
+        if (tdata.timeoutId !== undefined) {
+            clearTimeout(tdata.timeoutId);
+            tdata.timeoutId = undefined;
         }
     }
     _stopthread(tdata) {
