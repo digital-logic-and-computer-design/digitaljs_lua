@@ -401,6 +401,24 @@ export class LuaRunner {
             return 0;
         })
     };
+    #lprint(L) {
+        const n = lua_gettop(L);
+        const out = [];
+        lua_getglobal(L, to_luastring("tostring", true));
+        for (let i = 1; i <= n; i++) {
+            lua_pushvalue(L, -1);
+            lua_pushvalue(L, i);
+            lua_call(L, 1, 1);
+            const s = lua_tostring(L, -1);
+            if (s === null)
+                return luaL_error(L, to_luastring("'tostring' must return a string to 'print'"));
+            out.push(to_jsstring(s));
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+        this.trigger('print', out);
+        return 0;
+    }
     constructor(circuit) {
         const L = this.#L = luaL_newstate();
         this.#circuit = circuit;
@@ -423,24 +441,7 @@ export class LuaRunner {
         lua_pop(L, 1);
         luaL_requiref(L, to_luastring("vec"), luaopen_vec, 1);
         lua_pop(L, 1);
-        lua_pushcfunction(L, lprotect((L) => {
-            const n = lua_gettop(L);
-            const out = [];
-            lua_getglobal(L, to_luastring("tostring", true));
-            for (let i = 1; i <= n; i++) {
-                lua_pushvalue(L, -1);
-                lua_pushvalue(L, i);
-                lua_call(L, 1, 1);
-                const s = lua_tostring(L, -1);
-                if (s === null)
-                    return luaL_error(L, to_luastring("'tostring' must return a string to 'print'"));
-                out.push(to_jsstring(s));
-                lua_pop(L, 1);
-            }
-            lua_pop(L, 1);
-            this.trigger('print', out);
-            return 0;
-        }));
+        lua_pushcfunction(L, lprotect((L) => this.#lprint(L)));
         lua_setglobal(L, 'print');
     }
     shutdown() {
@@ -479,12 +480,13 @@ export class LuaRunner {
         lua_pop(this.#L, 1);
         return ret;
     }
-    runThread(source) {
+    runThread(source, { printResult = false } = {}) {
         const thr = lua_newthread(this.#L);
         const pid = luaL_ref(this.#L, LUA_REGISTRYINDEX);
         const new_tdata = {
             pid: pid,
             env: thr,
+            printResult,
             waitMonitors: undefined,
             alarmId: undefined,
             timeoutId: undefined,
@@ -538,6 +540,8 @@ export class LuaRunner {
         }
     }
     _stopthread(tdata) {
+        if (tdata.printResult && lua_status(tdata.env) == LUA_OK && lua_gettop(tdata.env) > 0)
+            this.#lprint(tdata.env);
         luaL_unref(this.#L, LUA_REGISTRYINDEX, tdata.pid);
         this._removeWaitMonitors(tdata);
         this.#pidthreads.delete(tdata.pid);
