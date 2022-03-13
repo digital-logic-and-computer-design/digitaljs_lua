@@ -405,6 +405,39 @@ export class LuaRunner {
             this.#circuit.addDisplay(display);
             // TODO: remove displays on shutdown
             return 0;
+        }),
+        running: (L) => {
+            lua_pushboolean(L, this.#circuit.running);
+            return 1;
+        },
+        start: lprotect((L) => {
+            if (!this.#circuit.running)
+                this.#circuit.start();
+            return 0;
+        }),
+        stop: lprotect((L) => {
+            const args = lua_gettop(L);
+            let synchronous = false;
+            if (args > 0)
+                synchronous = lua_toboolean(L, 1);
+            const wait = this.#circuit.stop({ synchronous: synchronous });
+            if (!wait)
+                return 0;
+            const tdata = this.#threads.get(L);
+            if (tdata === undefined) // Cannot suspend thread
+                return 0;
+            tdata.hasYield = true;
+            tdata.stopCallback = () => {
+                this._resume(tdata);
+            };
+            wait.then(() => {
+                if (tdata.stopCallback) {
+                    const callback = tdata.stopCallback;
+                    tdata.stopCallback = undefined;
+                    callback();
+                }
+            });
+            lua_yield(L, 0);
         })
     };
     #lprint(L) {
@@ -496,6 +529,7 @@ export class LuaRunner {
             waitMonitors: undefined,
             alarmId: undefined,
             timeoutId: undefined,
+            stopCallback: undefined,
             hasYield: false
         };
         this.#pidthreads.set(pid, new_tdata);
@@ -543,6 +577,9 @@ export class LuaRunner {
         if (tdata.timeoutId !== undefined) {
             clearTimeout(tdata.timeoutId);
             tdata.timeoutId = undefined;
+        }
+        if (tdata.stopCallback !== undefined) {
+            tdata.stopCallback = undefined;
         }
     }
     _stopthread(tdata) {
