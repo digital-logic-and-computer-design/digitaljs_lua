@@ -19,7 +19,7 @@ const {
     luaL_newstate,
     luaL_newmetatable,
     luaL_setmetatable,
-    luaL_loadstring,
+    luaL_loadbuffer,
     luaL_argcheck,
     luaL_argerror,
     luaL_error,
@@ -109,16 +109,20 @@ function lua_handle_error(L, emsg, ret) {
     return ret;
 }
 
-function lua_load_jsstring_error(L, source, prependReturn) {
+function lua_load_jsstring_error(L, source, name, prependReturn) {
+    name = name || source;
+    const loadbuffer = (source) => {
+        return luaL_loadbuffer(L, to_luastring(source), source.length, name);
+    };
     if (prependReturn) {
-        const ret = luaL_loadstring(L, to_luastring(`return ${source};`));
+        const ret = loadbuffer(`return ${source};`);
         if (ret == LUA_OK)
             return ret;
         lua_pop(L, 1);
     }
     return lua_handle_error(L,
         "Failed loading LUA code:", 
-        luaL_loadstring(L, to_luastring(source)));
+        loadbuffer(source));
 }
 
 function lua_pcall_error(L, nargs, nresults, msgh) {
@@ -519,7 +523,7 @@ export class LuaRunner {
         lua_pop(this.#L, 1);
         return ret;
     }
-    runThread(source, { printResult = false, prependReturn = false } = {}) {
+    runThread(source, { name, printResult = false, prependReturn = false } = {}) {
         const thr = lua_newthread(this.#L);
         const pid = luaL_ref(this.#L, LUA_REGISTRYINDEX);
         const new_tdata = {
@@ -546,7 +550,7 @@ export class LuaRunner {
             lua_yield(thr, 0);
         }, LUA_MASKCOUNT, 1e7);
         try {
-            const ret_ls = lua_load_jsstring_error(thr, source, prependReturn);
+            const ret_ls = lua_load_jsstring_error(thr, source, name, prependReturn);
             const ret_re = lua_resume_error(thr, null, 0);
             if (ret_re == LUA_YIELD)
                 return pid;
