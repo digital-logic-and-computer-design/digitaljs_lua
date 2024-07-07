@@ -19,7 +19,7 @@ const {
     luaL_newstate,
     luaL_newmetatable,
     luaL_setmetatable,
-    luaL_loadstring,
+    luaL_loadbuffer,
     luaL_argcheck,
     luaL_argerror,
     luaL_error,
@@ -45,6 +45,7 @@ const {
     lua_resume,
     lua_remove,
     lua_setfield,
+    lua_sethook,
     lua_setmetatable,
     lua_setglobal,
     lua_isboolean,
@@ -61,6 +62,7 @@ const {
     lua_yield,
     lua_status,
     LUA_OK,
+    LUA_MASKCOUNT,
     LUA_YIELD,
     LUA_REGISTRYINDEX
 } = lua;
@@ -107,10 +109,20 @@ function lua_handle_error(L, emsg, ret) {
     return ret;
 }
 
-function lua_load_jsstring_error(L, source) {
+function lua_load_jsstring_error(L, source, name, prependReturn) {
+    name = name || source;
+    const loadbuffer = (source) => {
+        return luaL_loadbuffer(L, to_luastring(source), source.length, name);
+    };
+    if (prependReturn) {
+        const ret = loadbuffer(`return ${source};`);
+        if (ret == LUA_OK)
+            return ret;
+        lua_pop(L, 1);
+    }
     return lua_handle_error(L,
         "Failed loading LUA code:", 
-        luaL_loadstring(L, to_luastring(source)));
+        loadbuffer(source));
 }
 
 function lua_pcall_error(L, nargs, nresults, msgh) {
@@ -306,6 +318,7 @@ export class LuaRunner {
             if (!lua_isyieldable(L)) luaL_error(L, "sim.sleep: thread not yieldable");
             const tdata = this.#threads.get(L);
             if (tdata === undefined) luaL_error(L, "sim.sleep: thread not suspendable");
+            tdata.hasYield = true;
             const delay = luaL_checkinteger(L, 1);
             luaL_argcheck(L, delay > 0, 1, "sim.sleep: too short delay");
             this._enqueue(tdata, this.#circuit.tick + delay);
@@ -315,6 +328,7 @@ export class LuaRunner {
             if (!lua_isyieldable(L)) luaL_error(L, "sim.wait: thread not yieldable");
             const tdata = this.#threads.get(L);
             if (tdata === undefined) luaL_error(L, "sim.wait: thread not suspendable");
+            tdata.hasYield = true;
             const delay = luaL_optinteger(L, 2, undefined);
             const evt = lua_checkevent(L, 1);
             console.assert(tdata.waitMonitors === undefined);
@@ -325,7 +339,7 @@ export class LuaRunner {
         },
         posedge: (L) => {
             const args = lua_gettop(L);
-            if (args.length < 1) luaL_error(L, "sim.posedge: not enough arguments");
+            if (args < 1) luaL_error(L, "sim.posedge: not enough arguments");
             const wire = this._vararg_findwire(L, args, 0);
             if (wire === undefined) luaL_error(L, "sim.posedge: wire not found");
             if (wire.get('bits') != 1) luaL_error(L, "sim.posedge: wire not 1-bit");
@@ -334,7 +348,7 @@ export class LuaRunner {
         },
         negedge: (L) => {
             const args = lua_gettop(L);
-            if (args.length < 1) luaL_error(L, "sim.negedge: not enough arguments");
+            if (args < 1) luaL_error(L, "sim.negedge: not enough arguments");
             const wire = this._vararg_findwire(L, args, 0);
             if (wire === undefined) luaL_error(L, "sim.negedge: wire not found");
             if (wire.get('bits') != 1) luaL_error(L, "sim.negedge: wire not 1-bit");
@@ -343,7 +357,7 @@ export class LuaRunner {
         },
         value: (L) => {
             const args = lua_gettop(L);
-            if (args.length < 2) luaL_error(L, "sim.value: not enough arguments");
+            if (args < 2) luaL_error(L, "sim.value: not enough arguments");
             const wire = this._vararg_findwire(L, args, 1);
             if (wire === undefined) luaL_error(L, "sim.value: wire not found");
             const val = lua_check3vl(L, 1, wire.get('bits'));
@@ -384,7 +398,7 @@ export class LuaRunner {
         },
         getvalue: (L) => {
             const args = lua_gettop(L);
-            if (args.length < 1) luaL_error(L, "sim.getvalue: not enough arguments");
+            if (args < 1) luaL_error(L, "sim.getvalue: not enough arguments");
             const wire = this._vararg_findwire(L, args, 0);
             if (wire === undefined) luaL_error(L, "sim.getvalue: wire not found");
             lua_push3vl(L, wire.get('signal'));
@@ -395,8 +409,59 @@ export class LuaRunner {
             this.#circuit.addDisplay(display);
             // TODO: remove displays on shutdown
             return 0;
+        }),
+        running: (L) => {
+            lua_pushboolean(L, this.#circuit.running);
+            return 1;
+        },
+        start: lprotect((L) => {
+            if (!this.#circuit.running)
+                this.#circuit.start();
+            return 0;
+        }),
+        stop: lprotect((L) => {
+            const args = lua_gettop(L);
+            let synchronous = false;
+            if (args > 0)
+                synchronous = lua_toboolean(L, 1);
+            const wait = this.#circuit.stop({ synchronous: synchronous });
+            if (!wait)
+                return 0;
+            const tdata = this.#threads.get(L);
+            if (tdata === undefined) // Cannot suspend thread
+                return 0;
+            tdata.hasYield = true;
+            tdata.stopCallback = () => {
+                this._resume(tdata);
+            };
+            wait.then(() => {
+                if (tdata.stopCallback) {
+                    const callback = tdata.stopCallback;
+                    tdata.stopCallback = undefined;
+                    callback();
+                }
+            });
+            lua_yield(L, 0);
         })
     };
+    #lprint(L) {
+        const n = lua_gettop(L);
+        const out = [];
+        lua_getglobal(L, to_luastring("tostring", true));
+        for (let i = 1; i <= n; i++) {
+            lua_pushvalue(L, -1);
+            lua_pushvalue(L, i);
+            lua_call(L, 1, 1);
+            const s = lua_tostring(L, -1);
+            if (s === null)
+                return luaL_error(L, to_luastring("'tostring' must return a string to 'print'"));
+            out.push(to_jsstring(s));
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+        this.trigger('print', out);
+        return 0;
+    }
     constructor(circuit) {
         const L = this.#L = luaL_newstate();
         this.#circuit = circuit;
@@ -419,24 +484,7 @@ export class LuaRunner {
         lua_pop(L, 1);
         luaL_requiref(L, to_luastring("vec"), luaopen_vec, 1);
         lua_pop(L, 1);
-        lua_pushcfunction(L, lprotect((L) => {
-            const n = lua_gettop(L);
-            const out = [];
-            lua_getglobal(L, to_luastring("tostring", true));
-            for (let i = 1; i <= n; i++) {
-                lua_pushvalue(L, -1);
-                lua_pushvalue(L, i);
-                lua_call(L, 1, 1);
-                const s = lua_tostring(L, -1);
-                if (s === null)
-                    return luaL_error(L, to_luastring("'tostring' must return a string to 'print'"));
-                out.push(to_jsstring(s));
-                lua_pop(L, 1);
-            }
-            lua_pop(L, 1);
-            this.trigger('print', out);
-            return 0;
-        }));
+        lua_pushcfunction(L, lprotect((L) => this.#lprint(L)));
         lua_setglobal(L, 'print');
     }
     shutdown() {
@@ -475,19 +523,34 @@ export class LuaRunner {
         lua_pop(this.#L, 1);
         return ret;
     }
-    runThread(source) {
+    runThread(source, { name, printResult = false, prependReturn = false } = {}) {
         const thr = lua_newthread(this.#L);
         const pid = luaL_ref(this.#L, LUA_REGISTRYINDEX);
         const new_tdata = {
             pid: pid,
-            env: thr, 
+            env: thr,
+            printResult,
             waitMonitors: undefined,
-            alarmId: undefined
+            alarmId: undefined,
+            timeoutId: undefined,
+            stopCallback: undefined,
+            hasYield: false
         };
         this.#pidthreads.set(pid, new_tdata);
         this.#threads.set(thr, new_tdata);
+        lua_sethook(thr, (thr) => {
+            if (new_tdata.hasYield) {
+                new_tdata.hasYield = false;
+                return;
+            }
+            new_tdata.timeoutId = setTimeout(() => {
+                new_tdata.timeoutId = undefined;
+                this._resume(new_tdata);
+            }, 0);
+            lua_yield(thr, 0);
+        }, LUA_MASKCOUNT, 1e7);
         try {
-            const ret_ls = lua_load_jsstring_error(thr, source);
+            const ret_ls = lua_load_jsstring_error(thr, source, name, prependReturn);
             const ret_re = lua_resume_error(thr, null, 0);
             if (ret_re == LUA_YIELD)
                 return pid;
@@ -515,8 +578,17 @@ export class LuaRunner {
             this.#circuit.unalarm(tdata.alarmId);
             tdata.alarmId = undefined;
         }
+        if (tdata.timeoutId !== undefined) {
+            clearTimeout(tdata.timeoutId);
+            tdata.timeoutId = undefined;
+        }
+        if (tdata.stopCallback !== undefined) {
+            tdata.stopCallback = undefined;
+        }
     }
     _stopthread(tdata) {
+        if (tdata.printResult && lua_status(tdata.env) == LUA_OK && lua_gettop(tdata.env) > 0)
+            this.#lprint(tdata.env);
         luaL_unref(this.#L, LUA_REGISTRYINDEX, tdata.pid);
         this._removeWaitMonitors(tdata);
         this.#pidthreads.delete(tdata.pid);
